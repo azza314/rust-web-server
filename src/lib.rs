@@ -2,21 +2,19 @@
 extern crate actix_web; 
 
 use actix_web::{middleware, web, App, HttpRequest, HttpServer, Result};
-use serde::Serialize; 
+use serde::{Deserialize, Serialize}; 
 use std::cell::Cell; 
 use std::sync::atomic::{AtomicUsize, Ordering}; // 
 use std::sync::{Arc, Mutex}; // share and mutate things not atomic across multiple threads
 
-// handler that looks for header in get request & responds
+static SERVER_COUNTER: AtomicUsize = AtomicUsize::new(0); // handler that looks for header in get request & responds
 // with message based on that header
-static SERVER_COUNTER:Atomic Usize = AtomicUsize::new(0);
-
 struct AppState { // constructed in application factory
     server_id: usize, 
     request_count: Cell<usize>,
-    messages: Arc<Mutex<Vec<String>>>,
+    messages: Arc<Mutex<Vec<String>>>, 
 }
-//information about state
+
 #[derive(Serialize)]
 struct IndexResponse{
     server_id: usize, 
@@ -24,19 +22,57 @@ struct IndexResponse{
     messages: Vec<String>,
 }
 
-#[get("/")] // indext handler
-fn index(state: web::Data<AppState>) -> Result<web::Json<IndexResponse>\
-> {
+#[derive(Deserialize)]
+struct PostInput{
+    message: String,
+}
+
+#[derive(Serialize)]
+struct PostResponse{
+    server_id: usize, 
+    request_count: usize, 
+    message: String,
+}
+#[get("/")] // index handler
+fn index(state: web::Data<AppState>) -> Result<web::Json<IndexResponse>> 
+{
     let request_count = state.request_count.get() + 1; 
     state.request_count.set(request_count);
-    let ms  state.messages.lock().unwrap(); 
+    let ms = state.messages.lock().unwrap(); // to get access to data inside the mutex, we call the lock method
 
     Ok(web::Json(IndexResponse{
         server_id: state.server_id, 
         request_count, 
-        messages: ms.clone()
+        messages: ms.clone(),
     }))
+}
 
+fn post(msg: web::Json<PostInput>, state:web::Data<AppState>) -> Result<web::Json<PostResponse>>{
+    let request_count = state.request_count.get() + 1; 
+    state.request_count.set(request_count);
+
+    let mut ms = state.messages.lock().unwrap(); 
+    ms.push(msg.message.clone());
+
+    Ok(web::Json(PostResponse{
+        server_id: state.server_id,
+        request_count,
+        message: msg.message.clone(),
+    }))
+}
+#[post("/clear")]
+fn clear(state: web::Data<AppState>) -> Result<web::Json<IndexResponse>>
+{
+    let request_count = state.request_count.get() + 1;
+    state.request_count.set(request_count);
+    let mut ms = state.messages.lock().unwrap();
+    ms.clear();
+
+    Ok(web::Json(IndexResponse {
+        server_id: state.server_id,
+        request_count,
+        messages: vec![],
+    }))
 }
 
 pub struct MessageApp{
@@ -49,12 +85,23 @@ impl MessageApp{
     }
 
     pub fn run(&self) -> std::io::Result<()> {
+        let messages = Arc::new(Mutex::new(vec![]));
         println!("Starting HTTP Server: 127.0.0.1: {}", self.port);
         HttpServer::new(move || {
             App::new()
-
+                .data(AppState{
+                    server_id: SERVER_COUNTER.fetch_add(1, Ordering::SeqCst),
+                    request_count: Cell::new(0),
+                    messages: messages.clone(), // create shared messages vector outside of application factory
+                })
             .wrap(middleware::Logger::default())
                             .service(index)
+                            .service(
+                                web::resource("/send")
+                                .data(web::JsonConfig::default().limit(4096)) //bytes
+                                .route(web::post().to(post)),
+                            )
+                            .service(clear)
         })
         .bind(("127.0.0.1", self.port))?
         .workers(8)
