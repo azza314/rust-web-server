@@ -1,12 +1,16 @@
 #[macro_use]
 extern crate actix_web; 
 
-use actix_web::{middleware, web, App, HttpRequest, HttpServer, Result};
+use actix_web::{
+    error::{Error, InternalError, JsonPayloadError},
+    middleware, web, App, HttpRequest, HttpResponse, HttpServer, Result,
+};
+
 use serde::{Deserialize, Serialize}; 
 use std::cell::Cell; 
 use std::sync::atomic::{AtomicUsize, Ordering}; // 
 use std::sync::{Arc, Mutex}; // share and mutate things not atomic across multiple threads
-
+const LOG_FORMAT: &'static str = r#""%r" %s %b "%{User-Agent}i" %D"#;
 static SERVER_COUNTER: AtomicUsize = AtomicUsize::new(0); // handler that looks for header in get request & responds
 // with message based on that header
 struct AppState { // constructed in application factory
@@ -33,6 +37,14 @@ struct PostResponse{
     request_count: usize, 
     message: String,
 }
+
+#[derive(Serialize)]
+    struct PostError {
+        server_id: usize, 
+        request_count: usize, 
+        error: String,
+    }
+
 #[get("/")] // index handler
 fn index(state: web::Data<AppState>) -> Result<web::Json<IndexResponse>> 
 {
@@ -60,12 +72,13 @@ fn post(msg: web::Json<PostInput>, state:web::Data<AppState>) -> Result<web::Jso
         message: msg.message.clone(),
     }))
 }
+
 #[post("/clear")]
 fn clear(state: web::Data<AppState>) -> Result<web::Json<IndexResponse>>
 {
     let request_count = state.request_count.get() + 1;
     state.request_count.set(request_count);
-    let mut ms = state.messages.lock().unwrap();
+    let mut ms = state.messages.lock().unwrap(); // when the lock is locked, we can access our message data only when we're in this scope. When we leave this scope, the lock will be unlocked and we can no longer access the data. 
     ms.clear();
 
     Ok(web::Json(IndexResponse {
@@ -78,12 +91,23 @@ fn clear(state: web::Data<AppState>) -> Result<web::Json<IndexResponse>>
 pub struct MessageApp{
     port: u16, 
 }
+fn post_error(err: JsonPayloadError, req: &HttpRequest) -> Error {
+    let extns = req.extensions(); 
+    let state = extns.get::<web::Data<AppState>>().unwrap(); 
+    let request_count = state.request_count.get() + 1; 
+    state.request_count.set(request_count);
+    let post_error = PostError {
+        server_id: state.server_id, 
+        request_count, 
+        error: format!("{}", err),
+    };
+    InternalError::from_response(err, HttpResponse::BadRequest().json(post_error)).into()
+}
 
 impl MessageApp{
     pub fn new(port:u16) -> Self {
         MessageApp{port}
     }
-
     pub fn run(&self) -> std::io::Result<()> {
         let messages = Arc::new(Mutex::new(vec![]));
         println!("Starting HTTP Server: 127.0.0.1: {}", self.port);
@@ -94,11 +118,14 @@ impl MessageApp{
                     request_count: Cell::new(0),
                     messages: messages.clone(), // create shared messages vector outside of application factory
                 })
-            .wrap(middleware::Logger::default())
+            .wrap(middleware::Logger::new(LOG_FORMAT))
                             .service(index)
                             .service(
                                 web::resource("/send")
-                                .data(web::JsonConfig::default().limit(4096)) //bytes
+                                .data(web::JsonConfig::default()
+                                    .limit(4096)//bytes
+                                    .error_handler(post_error),
+                                ) 
                                 .route(web::post().to(post)),
                             )
                             .service(clear)
